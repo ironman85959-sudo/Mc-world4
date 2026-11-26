@@ -1,0 +1,301 @@
+name: Build APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'__EOF__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "MCWorldBackup"
+          include(":app")
+          __EOF__
+          cat > build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __EOF__
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.mcworldbackup"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.mcworldbackup"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.documentfile:documentfile:1.0.1")
+          }
+          __EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <package android:name="com.mojang.minecraftpe" />
+              </queries>
+              <application
+                  android:label="MC World Backup"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fp"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/file_paths.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="imports" path="imports/" />
+          </paths>
+          __EOF__
+          mkdir -p app/src/main/java/com/mcworldbackup
+          cat > app/src/main/java/com/mcworldbackup/MainActivity.kt <<'__EOF__'
+          package com.mcworldbackup
+
+          import android.app.Activity
+          import android.content.ActivityNotFoundException
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.DocumentsContract
+          import android.provider.MediaStore
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.content.FileProvider
+          import androidx.documentfile.provider.DocumentFile
+          import java.io.File
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipOutputStream
+
+          class MainActivity : Activity() {
+
+              private val reqTree = 1
+              private val reqFile = 2
+              private val mcPackage = "com.mojang.minecraftpe"
+              private val docAuthority = "com.android.externalstorage.documents"
+
+              private lateinit var status: TextView
+              private lateinit var worldsBox: LinearLayout
+              private lateinit var nextBtn: Button
+              private var importedFile: File? = null
+              private val prefs by lazy { getSharedPreferences("p", MODE_PRIVATE) }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun btn(text: String, onClick: () -> Unit) = Button(this).apply {
+                  this.text = text
+                  setOnClickListener { onClick() }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(24), dp(16), dp(16))
+                  }
+                  root.addView(TextView(this).apply { text = "MC World Backup"; textSize = 22f })
+                  root.addView(btn("1. Worlds folder access do (ek baar)") { pickTree() })
+                  worldsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(worldsBox)
+                  root.addView(TextView(this).apply { text = "\nImport"; textSize = 18f })
+                  root.addView(btn("2. Downloads se world file chuno") { pickFile() })
+                  nextBtn = btn("3. Next: Minecraft kholo aur import karo") { openInMinecraft() }
+                  nextBtn.isEnabled = false
+                  root.addView(nextBtn)
+                  status = TextView(this).apply { setPadding(0, dp(16), 0, 0) }
+                  root.addView(status)
+                  setContentView(ScrollView(this).apply {
+                      addView(root, ViewGroup.LayoutParams(-1, -2))
+                  })
+                  refreshWorlds()
+              }
+
+              private fun pickTree() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                      putExtra(
+                          DocumentsContract.EXTRA_INITIAL_URI,
+                          DocumentsContract.buildDocumentUri(docAuthority, "primary:games/com.mojang/minecraftWorlds")
+                      )
+                      addFlags(
+                          Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                              Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                      )
+                  }
+                  startActivityForResult(i, reqTree)
+              }
+
+              private fun pickFile() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "*/*"
+                      putExtra(
+                          DocumentsContract.EXTRA_INITIAL_URI,
+                          DocumentsContract.buildDocumentUri(docAuthority, "primary:Download")
+                      )
+                  }
+                  startActivityForResult(i, reqFile)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val uri = data?.data
+                  if (resultCode != RESULT_OK || uri == null) return
+                  when (requestCode) {
+                      reqTree -> {
+                          contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                          prefs.edit().putString("tree", uri.toString()).apply()
+                          refreshWorlds()
+                      }
+                      reqFile -> copyToCache(uri)
+                  }
+              }
+
+              private fun refreshWorlds() {
+                  worldsBox.removeAllViews()
+                  val saved = prefs.getString("tree", null) ?: return
+                  val root = DocumentFile.fromTreeUri(this, Uri.parse(saved))
+                  val worlds = try {
+                      root?.listFiles()?.filter { it.isDirectory } ?: emptyList()
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
+                  if (worlds.isEmpty()) {
+                      status.text = "Koi world nahi mila. minecraftWorlds folder select karo."
+                      return
+                  }
+                  for (w in worlds) {
+                      val title = readTitle(w) ?: (w.name ?: "world")
+                      worldsBox.addView(btn("Export: $title") { exportWorld(w, title) })
+                  }
+                  status.text = "${worlds.size} world mile."
+              }
+
+              private fun readTitle(dir: DocumentFile): String? = try {
+                  val f = dir.findFile("levelname.txt")
+                  f?.let { contentResolver.openInputStream(it.uri)?.use { s -> s.readBytes().decodeToString().trim() } }
+                      ?.ifEmpty { null }
+              } catch (e: Exception) {
+                  null
+              }
+
+              private fun exportWorld(dir: DocumentFile, title: String) {
+                  status.text = "Export ho raha hai: $title ..."
+                  Thread {
+                      val msg = try {
+                          val name = title.replace(Regex("[\\\\/:*?\"<>|]"), "_") + ".mcworld"
+                          val values = ContentValues().apply {
+                              put(MediaStore.Downloads.DISPLAY_NAME, name)
+                              put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                              put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                          }
+                          val out = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                              ?: throw Exception("Downloads me file nahi ban payi")
+                          contentResolver.openOutputStream(out)!!.buffered().use { os ->
+                              ZipOutputStream(os).use { zos -> zipDir(dir, zos, "") }
+                          }
+                          "Done! Downloads me save hua: $name"
+                      } catch (e: Exception) {
+                          "Export fail: ${e.message}"
+                      }
+                      runOnUiThread { status.text = msg }
+                  }.start()
+              }
+
+              private fun zipDir(dir: DocumentFile, zos: ZipOutputStream, prefix: String) {
+                  for (f in dir.listFiles()) {
+                      val n = f.name ?: continue
+                      if (f.isDirectory) {
+                          zipDir(f, zos, "$prefix$n/")
+                      } else {
+                          zos.putNextEntry(ZipEntry("$prefix$n"))
+                          contentResolver.openInputStream(f.uri)?.use { it.copyTo(zos) }
+                          zos.closeEntry()
+                      }
+                  }
+              }
+
+              private fun copyToCache(uri: Uri) {
+                  status.text = "File add ho rahi hai..."
+                  Thread {
+                      val msg = try {
+                          val dir = File(cacheDir, "imports").apply { deleteRecursively(); mkdirs() }
+                          val f = File(dir, "world.mcworld")
+                          contentResolver.openInputStream(uri)!!.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                          importedFile = f
+                          runOnUiThread { nextBtn.isEnabled = true }
+                          "World file add ho gayi. Ab Next dabao."
+                      } catch (e: Exception) {
+                          "Import fail: ${e.message}"
+                      }
+                      runOnUiThread { status.text = msg }
+                  }.start()
+              }
+
+              private fun openInMinecraft() {
+                  val f = importedFile ?: return
+                  val uri = FileProvider.getUriForFile(this, "$packageName.fp", f)
+                  val i = Intent(Intent.ACTION_VIEW).apply {
+                      setDataAndType(uri, "application/octet-stream")
+                      setPackage(mcPackage)
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                  }
+                  try {
+                      startActivity(i)
+                  } catch (e: ActivityNotFoundException) {
+                      Toast.makeText(this, "Minecraft install nahi mila ya file open nahi kar paya", Toast.LENGTH_LONG).show()
+                  }
+              }
+          }
+          __EOF__
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MCWorldBackup-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
